@@ -1,16 +1,21 @@
 services:
   - type: worker
-    name: sala-futuro-stressor
+    name: price-zero-stressor
     runtime: python
     plan: free
     
-    # Força o uso do python do ambiente Nixpacks
-    buildCommand: "/usr/local/bin/python -m pip install -r requirements.txt"
-    startCommand: "/usr/local/bin/python main.py"
+    # Comando de build simples e direto
+    buildCommand: "pip install -r requirements.txt"
+    
+    # Comando de start simples e direto
+    startCommand: "python main.py"
     
     envVars:
       - key: WORKERS_PER_TARGET
         value: "25"
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"
+      
     autoDeploy: false
