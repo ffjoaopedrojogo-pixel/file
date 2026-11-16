@@ -1,0 +1,10 @@
+services:
+  - type: worker
+    name: saladofuturo-stressor
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
+    envVars:
+      - key: WORKERS_PER_TARGET
+        value: "30"
